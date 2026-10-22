@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shareguard"
+version = "0.1.0"
+description = "Local pre-sharing sensitive-information scanner (files, folders, ZIP archives)"
+requires-python = ">=3.11"
+dependencies = []
+license = { text = "See LICENSE" }
+
+[project.scripts]
+shareguard = "shareguard.cli:main"
+
+[project.gui-scripts]
+shareguard-gui = "shareguard.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

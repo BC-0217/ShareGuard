@@ -1,0 +1,57 @@
+name: build-windows
+
+# Manual only. Builds and smoke-tests the portable release; publishing a
+# GitHub release stays a separate manual step.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Fetch source
+        shell: bash
+        run: |
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -c "http.extraheader=AUTHORIZATION: bearer ${{ github.token }}" fetch -q --depth=1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+
+      # The build tool is the only non-stdlib dependency (build time only).
+      # Version pinned to the one used for local verification; package hashes
+      # are not pinned here (UNVERIFIED: add --require-hashes with verified hashes).
+      - name: Install build tool
+        shell: pwsh
+        run: |
+          python --version
+          python -m pip install --disable-pip-version-check "pyinstaller==6.21.0"
+
+      - name: Unit tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -t .
+
+      - name: Build
+        shell: pwsh
+        run: ./tools/build_windows.ps1
+
+      - name: Packaged smoke test
+        shell: pwsh
+        run: |
+          $run = Get-ChildItem -LiteralPath dist -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $run) { throw "build did not create a run directory" }
+          python tools/packaged_smoke.py (Join-Path $run.FullName "ShareGuard-0.1.0-windows-x64")
+
+      # UNVERIFIED-PIN: referenced by tag, not by a verified commit SHA.
+      # Replace with a verified immutable SHA before relying on this step.
+      - name: Upload release ZIP (workflow artifact only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShareGuard-0.1.0-windows-x64
+          path: |
+            dist/*/ShareGuard-0.1.0-windows-x64.zip
+            dist/*/SHA256SUMS.txt
+          if-no-files-found: error
