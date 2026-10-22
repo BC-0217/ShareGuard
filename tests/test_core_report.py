@@ -179,6 +179,28 @@ class ReportExport(WorkDirTestCase):
                         side_effect=RuntimeError(PATH_CANARY)):
             self.assert_code("REPORT_WRITE_FAILED", os.path.join(self.out_dir, "u.json"))
 
+    @unittest.skipUnless(WINDOWS, "Win32 report handle flags")
+    def test_report_write_handle_never_uses_backup_semantics(self):
+        from shareguard import _winfs
+
+        dest = os.path.join(self.out_dir, "write-flags.json")
+        with mock.patch.object(
+                _winfs, "_CreateFileW", wraps=_winfs._CreateFileW) as opened:
+            write_report(self.result, dest, [self.input_dir])
+
+        create_calls = [
+            item for item in opened.call_args_list
+            if item.args[4] == _winfs.CREATE_NEW
+        ]
+        self.assertEqual(len(create_calls), 1)
+        created = create_calls[0]
+        self.assertEqual(
+            created.args[1], _winfs.GENERIC_WRITE | _winfs.DELETE)
+        self.assertTrue(
+            created.args[5] & _winfs.FILE_FLAG_OPEN_REPARSE_POINT)
+        self.assertFalse(
+            created.args[5] & _winfs.FILE_FLAG_BACKUP_SEMANTICS)
+
     @unittest.skipUnless(WINDOWS, "Win32 created-handle verification")
     def test_created_handle_final_path_mismatch_deletes_file(self):
         from shareguard import _winfs

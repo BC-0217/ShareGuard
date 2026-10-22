@@ -5,10 +5,13 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import gc
+import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -153,6 +156,45 @@ _PHYSICAL_HIT_SKIP_REASON = (
     "physical screen hit test requires a visible window station and "
     "matching active input desktop"
 )
+_PHYSICAL_CHILD_TIMEOUT_SECONDS = 25
+_PHYSICAL_DIAGNOSTIC_PREFIX = "SHAREGUARD_NATIVE_HIT_DIAGNOSTIC "
+_PHYSICAL_GATE_FIELDS = frozenset(
+    {
+        "window_station_observable",
+        "window_station_visible",
+        "input_desktop_accessible",
+        "thread_desktop_handle_available",
+        "desktop_names_observable",
+        "input_desktop_matches_thread",
+        "input_desktop_handle_closed",
+    }
+)
+_PHYSICAL_ELIGIBILITY_FIELDS = (
+    "window_station_observable",
+    "window_station_visible",
+    "input_desktop_accessible",
+    "thread_desktop_handle_available",
+    "desktop_names_observable",
+    "input_desktop_matches_thread",
+)
+_PHYSICAL_BUTTON_NAMES = frozenset(
+    {"add_files", "add_folder", "clear", "scan", "reveal", "save", "cancel"}
+)
+_PHYSICAL_COMBINATIONS = frozenset(
+    (size, language, theme)
+    for size in ((720, 480), (900, 620))
+    for language in ("ko", "en")
+    for theme in ("light", "dark")
+)
+_PHYSICAL_CHILD_CODE = """\
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root / "src"))
+sys.path.insert(0, str(root))
+from tests.test_gui_native_bounds import _run_physical_child
+raise SystemExit(_run_physical_child(sys.argv[2]))
+"""
 
 
 def _user_object_name(handle):
@@ -452,9 +494,13 @@ class NativeClientBoundsTests(unittest.TestCase):
         self._run_matrix("logical", check_physical_hits=False)
 
     def test_physical_screen_hits_at_supported_sizes(self):
+        self._run_physical_in_fresh_child()
+
+    def _child_physical_screen_hits_at_supported_sizes(self):
         eligible, diagnostics = physical_hit_preconditions()
-        precondition_path = ROOT / "artifacts" / "ui-native-hit-preconditions.json"
-        precondition_path.parent.mkdir(parents=True, exist_ok=True)
+        precondition_path = (
+            self._artifact_directory() / "ui-native-hit-preconditions.json"
+        )
         precondition_path.write_text(
             json.dumps(
                 {
@@ -474,6 +520,549 @@ class NativeClientBoundsTests(unittest.TestCase):
             "physical-hit",
             check_physical_hits=True,
             os_preconditions=diagnostics,
+        )
+
+    def _artifact_directory(self):
+        return Path(getattr(self, "_artifact_dir", ROOT / "artifacts"))
+
+    def _run_physical_in_fresh_child(self):
+        artifact_root = (ROOT / "artifacts").resolve()
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(
+            tempfile.mkdtemp(prefix="native-physical-", dir=artifact_root)
+        ).resolve()
+        if run_dir.parent != artifact_root or run_dir.is_symlink():
+            raise AssertionError("fresh physical artifact directory containment failed")
+
+        command = [
+            sys.executable,
+            "-I",
+            "-c",
+            _PHYSICAL_CHILD_CODE,
+            str(ROOT),
+            str(run_dir),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_PHYSICAL_CHILD_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout or ""
+            stderr = error.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", "replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            (run_dir / "child-stdout.txt").write_text(stdout, encoding="utf-8")
+            (run_dir / "child-stderr.txt").write_text(stderr, encoding="utf-8")
+            raise AssertionError("fresh physical child exceeded 25 seconds")
+
+        (run_dir / "child-stdout.txt").write_text(
+            completed.stdout, encoding="utf-8"
+        )
+        (run_dir / "child-stderr.txt").write_text(
+            completed.stderr, encoding="utf-8"
+        )
+        self._verify_fresh_child(
+            run_dir, completed.returncode, completed.stderr
+        )
+
+    @staticmethod
+    def _safe_child_counts(result, returncode):
+        counts = {"returncode": returncode}
+        if not isinstance(result, dict):
+            counts["result_available"] = False
+            return counts
+        counts.update(
+            {
+                "result_available": True,
+                "tests_run": result.get("tests_run"),
+                "child_invocations": result.get("child_invocations"),
+                "failures": result.get("failures"),
+                "errors": result.get("errors"),
+                "skip_count": (
+                    len(result.get("skips"))
+                    if isinstance(result.get("skips"), list)
+                    else None
+                ),
+                "expected_failures": result.get("expected_failures"),
+                "unexpected_successes": result.get("unexpected_successes"),
+                "successful": result.get("successful"),
+            }
+        )
+        return counts
+
+    @staticmethod
+    def _forward_safe_child_diagnostics(child_stderr):
+        expected_keys = {
+            "schema",
+            "os_gate_booleans",
+            "wts_current_session_state_observable",
+            "wts_current_session_active",
+            "process_session_observable",
+            "process_is_active_console",
+            "foreground_owner_is_our_pid",
+            "root_native_outer_is_foreground",
+            "window_from_point_is_null",
+            "window_from_point_owner_is_our_pid",
+            "tk_containing_is_none",
+            "tk_containing_is_our_widget",
+            "tk_containing_is_our_root",
+            "own_root_outer_rect",
+            "own_root_client_rect",
+            "own_widget_screen_rect",
+            "dpi_for_own_root",
+            "thread_dpi_awareness",
+            "button",
+        }
+        boolean_keys = expected_keys - {
+            "schema",
+            "os_gate_booleans",
+            "own_root_outer_rect",
+            "own_root_client_rect",
+            "own_widget_screen_rect",
+            "dpi_for_own_root",
+            "thread_dpi_awareness",
+            "button",
+        }
+        for line in child_stderr.splitlines():
+            if not line.startswith(_PHYSICAL_DIAGNOSTIC_PREFIX):
+                continue
+            try:
+                payload = json.loads(line[len(_PHYSICAL_DIAGNOSTIC_PREFIX) :])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            gates = payload.get("os_gate_booleans")
+            rects = (
+                payload.get("own_root_outer_rect"),
+                payload.get("own_root_client_rect"),
+                payload.get("own_widget_screen_rect"),
+            )
+            if (
+                set(payload) != expected_keys
+                or payload.get("schema") != "shareguard.native-hit-diagnostic/1"
+                or payload.get("button") not in _PHYSICAL_BUTTON_NAMES
+                or not isinstance(gates, dict)
+                or set(gates) != _PHYSICAL_GATE_FIELDS
+                or not all(type(value) is bool for value in gates.values())
+                or not all(type(payload[key]) is bool for key in boolean_keys)
+                or not all(
+                    rect is None
+                    or (
+                        isinstance(rect, list)
+                        and len(rect) == 4
+                        and all(type(value) is int for value in rect)
+                    )
+                    for rect in rects
+                )
+                or not all(
+                    value is None or type(value) is int
+                    for value in (
+                        payload.get("dpi_for_own_root"),
+                        payload.get("thread_dpi_awareness"),
+                    )
+                )
+            ):
+                continue
+            print(
+                _PHYSICAL_DIAGNOSTIC_PREFIX
+                + json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _verify_fresh_child(self, run_dir, returncode, child_stderr):
+        result = None
+
+        def fail(message):
+            self._forward_safe_child_diagnostics(child_stderr)
+            counts = self._safe_child_counts(result, returncode)
+            raise AssertionError(
+                "%s; child_counts=%s"
+                % (message, json.dumps(counts, sort_keys=True, separators=(",", ":")))
+            )
+
+        def require(condition, message):
+            if not condition:
+                fail(message)
+
+        def load_json(filename):
+            path = run_dir / filename
+            require(path.is_file(), "fresh child artifact is missing: " + filename)
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                fail("fresh child artifact is unreadable: " + filename)
+            require(isinstance(loaded, dict), "fresh child artifact is not an object")
+            return loaded
+
+        result_path = run_dir / "child-result.json"
+        require(result_path.is_file(), "fresh physical child result is missing")
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            fail("fresh physical child result is unreadable")
+        require(isinstance(result, dict), "fresh child result is not an object")
+        require(
+            set(result)
+            == {
+                "schema",
+                "child_marker",
+                "child_invocations",
+                "tests_run",
+                "failures",
+                "errors",
+                "skips",
+                "expected_failures",
+                "unexpected_successes",
+                "successful",
+            },
+            "fresh child result schema mismatch",
+        )
+        require(
+            result.get("schema") == "shareguard.native-physical-child/1",
+            "fresh child result schema version mismatch",
+        )
+        for field in (
+            "child_invocations",
+            "tests_run",
+            "failures",
+            "errors",
+            "expected_failures",
+            "unexpected_successes",
+        ):
+            require(type(result.get(field)) is int, "fresh child count type mismatch")
+        require(type(result.get("successful")) is bool, "fresh child outcome type mismatch")
+        require(
+            isinstance(result.get("skips"), list)
+            and all(isinstance(reason, str) for reason in result["skips"]),
+            "fresh child skip summary mismatch",
+        )
+        require(result["tests_run"] == 1, "fresh child did not run exactly once")
+        require(result["child_invocations"] == 1, "recursive child execution")
+        require(
+            result.get("child_marker")
+            == "_child_physical_screen_hits_at_supported_sizes",
+            "unexpected fresh child marker",
+        )
+        require(result["expected_failures"] == 0, "unexpected expected failure")
+        require(result["unexpected_successes"] == 0, "unexpected unittest success")
+        require(result["errors"] == 0, "fresh physical child errored")
+        require(result["failures"] == 0, "fresh physical child failed")
+        require(returncode == 0, "fresh physical child exited nonzero")
+        require(result["successful"] is True, "fresh child was not successful")
+
+        unittest_output_path = run_dir / "unittest-output.txt"
+        require(unittest_output_path.is_file(), "fresh child unittest summary is missing")
+        try:
+            unittest_output = unittest_output_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            fail("fresh child unittest summary is unreadable")
+        require("Ran 1 test in " in unittest_output, "fresh child unittest count missing")
+        require("\nOK" in unittest_output, "fresh child unittest outcome missing")
+
+        precondition = load_json("ui-native-hit-preconditions.json")
+        require(
+            set(precondition) == {"schema", "safe_booleans_only", "diagnostics"},
+            "fresh child OS-precondition schema mismatch",
+        )
+        require(
+            precondition.get("schema")
+            == "shareguard.ui-native-hit-preconditions/1",
+            "fresh child OS-precondition version mismatch",
+        )
+        require(
+            precondition.get("safe_booleans_only") is True,
+            "fresh child OS-precondition privacy marker mismatch",
+        )
+        gates = precondition.get("diagnostics")
+        require(
+            isinstance(gates, dict)
+            and set(gates) == _PHYSICAL_GATE_FIELDS
+            and all(type(value) is bool for value in gates.values()),
+            "fresh child OS-gate fields mismatch",
+        )
+        require(
+            gates["input_desktop_handle_closed"] is True,
+            "fresh child input desktop handle was not closed",
+        )
+        eligible = all(gates[field] for field in _PHYSICAL_ELIGIBILITY_FIELDS)
+
+        skips = result["skips"]
+        if skips:
+            require(len(skips) == 1, "unexpected fresh child skip count")
+            require(
+                skips[0] == _PHYSICAL_HIT_SKIP_REASON,
+                "unexpected fresh child skip reason",
+            )
+            require(not eligible, "eligible fresh child reported a physical-hit skip")
+            require(
+                "(skipped=1)" in unittest_output,
+                "fresh child unittest skip summary mismatch",
+            )
+            (run_dir / "parent-verification.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "shareguard.native-physical-parent/1",
+                        "outcome": "skipped",
+                        "child_invocations": 1,
+                        "unittest_tests_run": 1,
+                        "all_eligibility_conditions": False,
+                        "reason": _PHYSICAL_HIT_SKIP_REASON,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.skipTest(_PHYSICAL_HIT_SKIP_REASON)
+
+        require(eligible, "fresh child OS gate was not fully satisfied")
+        require("(skipped=" not in unittest_output, "unexpected unittest skip summary")
+        measurement = load_json("ui-native-physical-hit.json")
+        lifecycle = load_json("ui-native-lifecycle-physical-hit.json")
+
+        require(
+            set(measurement)
+            == {
+                "schema",
+                "measurements_only",
+                "test_outcome_source",
+                "evidence_kind",
+                "cases",
+                "button_cases",
+                "physical_hit_checks",
+                "minimum_client",
+                "normal_client",
+                "combinations",
+                "os_preconditions",
+            },
+            "fresh child measurement schema mismatch",
+        )
+        require(
+            measurement.get("schema")
+            == "shareguard.ui-native-bounds-measurements/1",
+            "fresh child measurement version mismatch",
+        )
+        require(
+            measurement.get("measurements_only") is True
+            and measurement.get("test_outcome_source") == "unittest result"
+            and measurement.get("evidence_kind") == "physical-hit",
+            "fresh child measurement provenance mismatch",
+        )
+        require(
+            measurement.get("minimum_client") == [720, 480]
+            and measurement.get("normal_client") == [900, 620],
+            "fresh child supported-client sizes mismatch",
+        )
+        require(measurement.get("cases") == 8, "fresh child case count mismatch")
+        require(
+            measurement.get("button_cases") == 56,
+            "fresh child button count mismatch",
+        )
+        require(
+            measurement.get("physical_hit_checks") == 56,
+            "fresh child physical-hit count mismatch",
+        )
+        require(
+            measurement.get("os_preconditions") == gates,
+            "fresh child measurement OS gates mismatch",
+        )
+        combinations = measurement.get("combinations")
+        require(
+            isinstance(combinations, list) and len(combinations) == 8,
+            "fresh child combination list mismatch",
+        )
+
+        seen = set()
+        hit_count = 0
+        for row in combinations:
+            require(isinstance(row, dict), "fresh child combination is not an object")
+            require(
+                set(row)
+                == {
+                    "requested",
+                    "client",
+                    "settle_samples",
+                    "language",
+                    "theme",
+                    "buttons",
+                    "rendered_rows",
+                },
+                "fresh child combination schema mismatch",
+            )
+            requested = row.get("requested")
+            client = row.get("client")
+            require(
+                isinstance(requested, list)
+                and len(requested) == 2
+                and all(type(value) is int for value in requested),
+                "fresh child requested client size mismatch",
+            )
+            require(client == requested, "fresh child actual client size mismatch")
+            combination = (
+                tuple(requested),
+                row.get("language"),
+                row.get("theme"),
+            )
+            require(
+                combination in _PHYSICAL_COMBINATIONS,
+                "fresh child contained an unsupported combination",
+            )
+            require(combination not in seen, "fresh child combination was duplicated")
+            seen.add(combination)
+            require(row.get("rendered_rows") == 4, "localized row count mismatch")
+            buttons = row.get("buttons")
+            require(
+                isinstance(buttons, dict)
+                and set(buttons) == _PHYSICAL_BUTTON_NAMES,
+                "fresh child button matrix mismatch",
+            )
+            width, height = requested
+            for name, button in buttons.items():
+                require(isinstance(button, dict), "fresh child button is not an object")
+                expected_fields = {
+                    "rect",
+                    "mapped",
+                    "viewable",
+                    "state",
+                    "hit",
+                    (
+                        "disabled_invoke_suppressed"
+                        if name == "cancel"
+                        else "invoked"
+                    ),
+                }
+                require(
+                    set(button) == expected_fields,
+                    "fresh child button measurement schema mismatch",
+                )
+                rect = button.get("rect")
+                require(
+                    isinstance(rect, list)
+                    and len(rect) == 4
+                    and all(type(value) is int for value in rect),
+                    "fresh child button rectangle mismatch",
+                )
+                left, top, right, bottom = rect
+                require(
+                    0 <= left < right <= width and 0 <= top < bottom <= height,
+                    "fresh child button was outside the client",
+                )
+                require(
+                    button.get("mapped") is True
+                    and button.get("viewable") is True,
+                    "fresh child button was not mapped and viewable",
+                )
+                require(button.get("hit") is True, "fresh child physical hit failed")
+                hit_count += 1
+                if name == "cancel":
+                    require(
+                        button.get("state") == "disabled"
+                        and button.get("disabled_invoke_suppressed") is True,
+                        "fresh child cancel state or invoke behavior mismatch",
+                    )
+                else:
+                    require(
+                        button.get("state") == "normal"
+                        and button.get("invoked") is True,
+                        "fresh child button state or invoke behavior mismatch",
+                    )
+        require(seen == _PHYSICAL_COMBINATIONS, "fresh child matrix was incomplete")
+        require(hit_count == 56, "fresh child physical-hit total mismatch")
+
+        require(
+            set(lifecycle)
+            == {
+                "schema",
+                "evidence_kind",
+                "creator_thread_id",
+                "callbacks",
+                "app_finalized",
+                "root_finalized",
+                "gc_collected",
+                "shutdown_failed",
+                "fallback_failed",
+            },
+            "fresh child lifecycle schema mismatch",
+        )
+        require(
+            lifecycle.get("schema") == "shareguard.ui-native-lifecycle/1"
+            and lifecycle.get("evidence_kind") == "physical-hit",
+            "fresh child lifecycle provenance mismatch",
+        )
+        require(
+            type(lifecycle.get("creator_thread_id")) is int
+            and type(lifecycle.get("gc_collected")) is int,
+            "fresh child lifecycle numeric fields mismatch",
+        )
+        require(
+            lifecycle.get("shutdown_failed") is False,
+            "fresh child GUI shutdown failed",
+        )
+        require(
+            lifecycle.get("fallback_failed") is False,
+            "fresh child fallback destroy failed",
+        )
+        require(lifecycle.get("app_finalized") is True, "fresh child app was retained")
+        require(lifecycle.get("root_finalized") is True, "fresh child root was retained")
+        callbacks = lifecycle.get("callbacks")
+        require(
+            isinstance(callbacks, list)
+            and len(callbacks) == 2
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"object", "thread_id"}
+                and type(item["thread_id"]) is int
+                for item in callbacks
+            ),
+            "fresh child lifecycle callbacks schema mismatch",
+        )
+        require(
+            sorted(item["object"] for item in callbacks) == ["app", "root"],
+            "fresh child lifecycle callbacks mismatch",
+        )
+        require(
+            all(
+                item["thread_id"] == lifecycle["creator_thread_id"]
+                for item in callbacks
+            ),
+            "fresh child lifecycle callback thread mismatch",
+        )
+        (run_dir / "parent-verification.json").write_text(
+            json.dumps(
+                {
+                    "schema": "shareguard.native-physical-parent/1",
+                    "outcome": "passed",
+                    "child_invocations": 1,
+                    "unittest_tests_run": 1,
+                    "unittest_failures": 0,
+                    "unittest_errors": 0,
+                    "unittest_expected_failures": 0,
+                    "unittest_unexpected_successes": 0,
+                    "combinations": 8,
+                    "button_cases": 56,
+                    "physical_hit_checks": 56,
+                    "all_os_gate_booleans": True,
+                    "shutdown_and_fallback_succeeded": True,
+                    "app_and_root_finalized": True,
+                    "callbacks_on_creator_thread": True,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
     def _run_matrix(
@@ -536,7 +1125,7 @@ class NativeClientBoundsTests(unittest.TestCase):
             if check_physical_hits
             else "ui-native-bounds.json"
         )
-        evidence_path = ROOT / "artifacts" / filename
+        evidence_path = self._artifact_directory() / filename
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         evidence_path.write_text(
             json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -780,8 +1369,8 @@ class NativeClientBoundsTests(unittest.TestCase):
             "shutdown_failed": shutdown_failed,
             "fallback_failed": fallback_failed,
         }
-        evidence_path = (
-            ROOT / "artifacts" / ("ui-native-lifecycle-%s.json" % self._evidence_label)
+        evidence_path = self._artifact_directory() / (
+            "ui-native-lifecycle-%s.json" % self._evidence_label
         )
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         evidence_path.write_text(
@@ -799,6 +1388,51 @@ class NativeClientBoundsTests(unittest.TestCase):
         )
         for event in self._lifecycle_events:
             self.assertEqual(event["thread_id"], self._creator_thread_id)
+
+
+def _validated_child_artifact_directory(raw_path):
+    artifact_root = (ROOT / "artifacts").resolve()
+    supplied = Path(raw_path)
+    if supplied.is_symlink():
+        raise AssertionError("child artifact directory must not be a symlink")
+    candidate = supplied.resolve(strict=True)
+    if (
+        candidate.parent != artifact_root
+        or not candidate.name.startswith("native-physical-")
+        or any(candidate.iterdir())
+    ):
+        raise AssertionError("child artifact directory is not fresh and owned")
+    return candidate
+
+
+def _run_physical_child(raw_artifact_dir):
+    artifact_dir = _validated_child_artifact_directory(raw_artifact_dir)
+    case = NativeClientBoundsTests(
+        "_child_physical_screen_hits_at_supported_sizes"
+    )
+    case._artifact_dir = artifact_dir
+    stream = io.StringIO()
+    result = unittest.TextTestRunner(stream=stream, verbosity=2).run(case)
+    (artifact_dir / "unittest-output.txt").write_text(
+        stream.getvalue(), encoding="utf-8"
+    )
+    summary = {
+        "schema": "shareguard.native-physical-child/1",
+        "child_marker": "_child_physical_screen_hits_at_supported_sizes",
+        "child_invocations": 1,
+        "tests_run": result.testsRun,
+        "failures": len(result.failures),
+        "errors": len(result.errors),
+        "skips": [reason for _test, reason in result.skipped],
+        "expected_failures": len(result.expectedFailures),
+        "unexpected_successes": len(result.unexpectedSuccesses),
+        "successful": result.wasSuccessful(),
+    }
+    (artifact_dir / "child-result.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":

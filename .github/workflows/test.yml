@@ -12,8 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # TEMPORARY DIAGNOSTIC / RELEASE HELD: restore Windows+Ubuntu before release.
-        os: [windows-latest]
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -36,13 +35,20 @@ jobs:
           "$PY" -c "import tkinter" && echo "tkinter available" || echo "tkinter unavailable: Tk-dependent tests will be skipped"
           echo "PY=$PY" >> "$GITHUB_ENV"
 
-      # TEMPORARY DIAGNOSTIC / RELEASE HELD: restore full unittest discovery
-      # on Windows and Ubuntu before release.
-      - name: Narrow hosted diagnostics (Windows)
+      - name: Unit tests (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: >-
-          "$PY" -m unittest
-          tests.test_core_fs.Permissions.test_unreadable_file_is_incomplete
-          tests.test_gui_native_bounds.NativeClientBoundsTests.test_physical_screen_hits_at_supported_sizes
-          -v
+        run: '"$PY" -m unittest discover -s tests -t . -v'
+
+      # Ubuntu exercises the internal synthetic/core development backend only.
+      # It is regression evidence, not a supported Linux product scan or an
+      # offline-filesystem guarantee. Public GUI live tests stay Windows-only.
+      - name: Development core regression (Ubuntu; not product support)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if command -v xvfb-run >/dev/null 2>&1; then
+            xvfb-run -a "$PY" -m unittest discover -s tests -t . -v
+          else
+            "$PY" -m unittest discover -s tests -t . -v
+          fi

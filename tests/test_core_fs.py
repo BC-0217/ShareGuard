@@ -506,6 +506,18 @@ class Permissions(WorkDirTestCase):
         self.assertEqual(r.completeness, INCOMPLETE, diagnostic_text)
         self.assertIn("ACCESS_DENIED", codes(r), diagnostic_text)
         self.assertEqual(r.findings, [], diagnostic_text)
+        if WINDOWS:
+            self.assertEqual(
+                direct_result.completeness, INCOMPLETE, diagnostic_text)
+            self.assertIn(
+                "ACCESS_DENIED", codes(direct_result), diagnostic_text)
+            self.assertEqual(direct_result.findings, [], diagnostic_text)
+            self.assertEqual(r.counts["bytes_scanned"], 0, diagnostic_text)
+            self.assertEqual(r.counts["files_scanned"], 0, diagnostic_text)
+            self.assertEqual(
+                direct_result.counts["bytes_scanned"], 0, diagnostic_text)
+            self.assertEqual(
+                direct_result.counts["files_scanned"], 0, diagnostic_text)
 
     def test_access_denied_mapping_is_incomplete(self):
         p = self.write("mapping/ordinary.txt", secret_line())
@@ -593,6 +605,231 @@ class IdentityChecks(WorkDirTestCase):
                 opened.assert_not_called()
         finally:
             parent.close()
+
+    @unittest.skipUnless(WINDOWS, "Win32 handle flags")
+    def test_regular_file_data_open_never_uses_backup_semantics(self):
+        from shareguard import _winfs
+
+        p = self.write("flags/ordinary.txt", "clean\n")
+        with mock.patch.object(
+                _winfs, "_CreateFileW", wraps=_winfs._CreateFileW) as opened:
+            handle = safeio.open_root(p)
+            handle.close()
+
+        leaf_calls = [
+            item for item in opened.call_args_list
+            if _winfs.same_path(str(item.args[0]), p)
+        ]
+        self.assertEqual(
+            [item.args[1] for item in leaf_calls],
+            [0, _winfs.GENERIC_READ],
+        )
+        for item in leaf_calls:
+            self.assertTrue(
+                item.args[5] & _winfs.FILE_FLAG_OPEN_REPARSE_POINT)
+            self.assertFalse(
+                item.args[5] & _winfs.FILE_FLAG_BACKUP_SEMANTICS)
+
+    @unittest.skipUnless(WINDOWS, "Win32 explicit backup selector")
+    def test_extra_flags_cannot_enable_backup_semantics(self):
+        from shareguard import _winfs
+
+        with mock.patch.object(
+                _winfs, "_CreateFileW",
+                side_effect=[101, 202]) as opened:
+            self.assertEqual(
+                _winfs._open_raw(
+                    r"C:\synthetic", _winfs.GENERIC_READ,
+                    _winfs.OPEN_EXISTING,
+                    _winfs.FILE_ATTRIBUTE_NORMAL
+                    | _winfs.FILE_FLAG_BACKUP_SEMANTICS),
+                101,
+            )
+            self.assertEqual(
+                _winfs._open_raw(
+                    r"C:\synthetic", _winfs.GENERIC_READ,
+                    _winfs.OPEN_EXISTING,
+                    _winfs.FILE_ATTRIBUTE_NORMAL
+                    | _winfs.FILE_FLAG_BACKUP_SEMANTICS,
+                    backup_semantics=True),
+                202,
+            )
+
+        implicit_flags = opened.call_args_list[0].args[5]
+        explicit_flags = opened.call_args_list[1].args[5]
+        self.assertTrue(
+            implicit_flags & _winfs.FILE_FLAG_OPEN_REPARSE_POINT)
+        self.assertTrue(implicit_flags & _winfs.FILE_ATTRIBUTE_NORMAL)
+        self.assertFalse(
+            implicit_flags & _winfs.FILE_FLAG_BACKUP_SEMANTICS)
+        self.assertTrue(
+            explicit_flags & _winfs.FILE_FLAG_BACKUP_SEMANTICS)
+
+    @unittest.skipUnless(WINDOWS, "Win32 constructor failure ownership")
+    def test_constructor_failure_closes_all_owned_raw_handles(self):
+        from shareguard import _winfs
+
+        for access, raw_handles, expected_closed in (
+                (0, [101], [101]),
+                (_winfs.GENERIC_READ, [101, 202], [202, 101])):
+            events = []
+
+            def verify(handle, _expected_path):
+                events.append(("verify", handle))
+                return False
+
+            def close(handle):
+                events.append(("close", handle))
+
+            with self.subTest(access=access), \
+                    mock.patch.object(
+                        _winfs, "_open_raw",
+                        side_effect=raw_handles), \
+                    mock.patch.object(
+                        _winfs, "_verify_handle",
+                        side_effect=verify), \
+                    mock.patch.object(
+                        _winfs, "_handle_binding",
+                        return_value=(1, 2, 0x80)), \
+                    mock.patch.object(
+                        _winfs, "final_path",
+                        return_value=r"C:\synthetic"), \
+                    mock.patch.object(
+                        _winfs, "WinHandle",
+                        side_effect=MemoryError("synthetic")), \
+                    mock.patch.object(
+                        _winfs, "_close", side_effect=close):
+                with self.assertRaises(MemoryError):
+                    _winfs.open_verified(
+                        r"C:\synthetic", r"C:\synthetic",
+                        access=access, expected_is_dir=False)
+
+            closed = [
+                handle for event, handle in events if event == "close"
+            ]
+            self.assertEqual(closed, expected_closed)
+            if access:
+                self.assertLess(
+                    events.index(("verify", 202)),
+                    events.index(("close", 101)),
+                )
+
+    @unittest.skipUnless(WINDOWS, "Win32 directory capability")
+    def test_directory_metadata_and_data_use_needed_backup_flag(self):
+        from shareguard import _winfs
+
+        directory_path = self.path("directory-flags")
+        os.makedirs(directory_path)
+        with mock.patch.object(
+                _winfs, "_CreateFileW", wraps=_winfs._CreateFileW) as opened:
+            handle = safeio.open_root(directory_path)
+            handle.close()
+
+        leaf_calls = [
+            item for item in opened.call_args_list
+            if _winfs.same_path(str(item.args[0]), directory_path)
+        ]
+        self.assertEqual(
+            [item.args[1] for item in leaf_calls],
+            [0, _winfs.GENERIC_READ],
+        )
+        for item in leaf_calls:
+            self.assertTrue(
+                item.args[5] & _winfs.FILE_FLAG_OPEN_REPARSE_POINT)
+            self.assertTrue(
+                item.args[5] & _winfs.FILE_FLAG_BACKUP_SEMANTICS)
+
+    @unittest.skipUnless(WINDOWS, "Win32 metadata handle ownership")
+    def test_zero_access_metadata_handle_transfers_ownership(self):
+        from shareguard import _winfs
+
+        with mock.patch.object(
+                _winfs, "_open_raw", return_value=101) as opened, \
+                mock.patch.object(
+                    _winfs, "_verify_handle", return_value=False), \
+                mock.patch.object(
+                    _winfs, "_handle_binding", return_value=(1, 2, 0x80)), \
+                mock.patch.object(
+                    _winfs, "final_path", return_value=r"C:\synthetic"), \
+                mock.patch.object(_winfs, "_close") as closed:
+            handle = _winfs.open_verified(
+                r"C:\synthetic", r"C:\synthetic", access=0,
+                expected_is_dir=False)
+            opened.assert_called_once_with(
+                r"C:\synthetic", 0, _winfs.OPEN_EXISTING,
+                backup_semantics=False)
+            closed.assert_not_called()
+            self.assertEqual(handle._h, 101)
+            handle.close()
+            closed.assert_called_once_with(101)
+
+    @unittest.skipUnless(WINDOWS, "Win32 access-denied handling")
+    def test_access_denied_has_no_backup_fallback_and_closes_pin(self):
+        from shareguard import _winfs
+
+        denied = safeio.FsError("ACCESS_DENIED", _winfs.ERROR_ACCESS_DENIED)
+        with mock.patch.object(
+                _winfs, "_open_raw", side_effect=[101, denied]) as opened, \
+                mock.patch.object(
+                    _winfs, "_verify_handle", return_value=False), \
+                mock.patch.object(
+                    _winfs, "_handle_binding", return_value=(1, 2, 0x80)), \
+                mock.patch.object(
+                    _winfs, "final_path", return_value=r"C:\synthetic"), \
+                mock.patch.object(_winfs, "_ReadFile") as read_file, \
+                mock.patch.object(_winfs, "_close") as closed:
+            with self.assertRaises(safeio.FsError) as cm:
+                _winfs.open_verified(
+                    r"C:\synthetic", r"C:\synthetic",
+                    expected_is_dir=False)
+
+        self.assertEqual(cm.exception.code, "ACCESS_DENIED")
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(opened.call_args_list[0].args[1], 0)
+        self.assertFalse(
+            opened.call_args_list[0].kwargs["backup_semantics"])
+        self.assertEqual(
+            opened.call_args_list[1].args[1], _winfs.GENERIC_READ)
+        self.assertFalse(
+            opened.call_args_list[1].kwargs["backup_semantics"])
+        self.assertIn(mock.call(101), closed.call_args_list)
+        read_file.assert_not_called()
+
+    @unittest.skipUnless(WINDOWS, "Win32 cross-handle verification")
+    def test_metadata_data_mismatches_fail_closed_and_close_both(self):
+        from shareguard import _winfs
+
+        cases = (
+            ("type", [False, True],
+             [(1, 2, 0x80), (1, 2, 0x80)]),
+            ("identity", [False, False],
+             [(1, 2, 0x80), (1, 3, 0x80)]),
+            ("attributes", [False, False],
+             [(1, 2, 0x80), (1, 2, 0x81)]),
+        )
+        for label, types_seen, bindings in cases:
+            with self.subTest(label=label), \
+                    mock.patch.object(
+                        _winfs, "_open_raw",
+                        side_effect=[101, 202]), \
+                    mock.patch.object(
+                        _winfs, "_verify_handle",
+                        side_effect=types_seen), \
+                    mock.patch.object(
+                        _winfs, "_handle_binding",
+                        side_effect=bindings), \
+                    mock.patch.object(
+                        _winfs, "final_path",
+                        return_value=r"C:\synthetic"), \
+                    mock.patch.object(_winfs, "_close") as closed:
+                with self.assertRaises(safeio.FsError) as cm:
+                    _winfs.open_verified(
+                        r"C:\synthetic", r"C:\synthetic",
+                        expected_is_dir=False)
+
+            self.assertEqual(cm.exception.code, "IDENTITY_UNVERIFIED")
+            self.assertIn(mock.call(202), closed.call_args_list)
+            self.assertIn(mock.call(101), closed.call_args_list)
 
     def test_clean_tree_is_complete(self):
         self.write("d/a.txt", "fine\n")

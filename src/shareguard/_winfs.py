@@ -390,11 +390,14 @@ class WinHandle:
         return names
 
 
-def _open_raw(sys_path: str, access: int, disposition: int, extra_flags: int = 0):
+def _open_raw(sys_path: str, access: int, disposition: int, extra_flags: int = 0,
+              *, backup_semantics: bool = False):
+    flags = (FILE_FLAG_OPEN_REPARSE_POINT
+             | (extra_flags & ~FILE_FLAG_BACKUP_SEMANTICS))
+    if backup_semantics:
+        flags |= FILE_FLAG_BACKUP_SEMANTICS
     h = _CreateFileW(sys_path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
-                     disposition,
-                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | extra_flags,
-                     None)
+                     disposition, flags, None)
     if h in (None, INVALID_HANDLE_VALUE):
         err = ctypes.get_last_error()
         raise FsError(_error_code(err), err)
@@ -419,19 +422,62 @@ def _verify_handle(h, expected_path: str) -> bool:
     return bool(attrs & FILE_ATTRIBUTE_DIRECTORY)
 
 
+def _handle_binding(h) -> tuple[int, int, int]:
+    """Return stable object identity plus attributes for cross-handle binding."""
+    info = BY_HANDLE_FILE_INFORMATION()
+    if not _GetFileInformationByHandle(h, ctypes.byref(info)):
+        raise FsError(IssueCode.IDENTITY_UNVERIFIED)
+    index = (info.nFileIndexHigh << 32) | info.nFileIndexLow
+    return info.dwVolumeSerialNumber, index, info.dwFileAttributes
+
+
 def open_verified(sys_path: str, expected_path: str,
-                  access: int = GENERIC_READ) -> WinHandle:
-    h = _open_raw(sys_path, access, OPEN_EXISTING)
+                  access: int = GENERIC_READ, *,
+                  expected_is_dir: bool) -> WinHandle:
+    """Open verified metadata first, then a separately verified data handle.
+
+    A zero-access metadata handle pins the object first. Directory capability
+    requires FILE_FLAG_BACKUP_SEMANTICS on Windows, but regular-file data and
+    report-write handles never receive that flag. The metadata pin stays open
+    until both handles match in type, identity, attributes, and final path.
+    """
+    metadata = None
+    data = None
     try:
-        is_dir = _verify_handle(h, expected_path)
-        final = final_path(h)
-    except BaseException:
-        _close(h)
-        raise
-    return WinHandle(h, final, is_dir)
+        metadata = _open_raw(
+            sys_path, 0, OPEN_EXISTING,
+            backup_semantics=expected_is_dir)
+        metadata_is_dir = _verify_handle(metadata, expected_path)
+        if metadata_is_dir != expected_is_dir:
+            raise FsError(IssueCode.IDENTITY_UNVERIFIED)
+        metadata_binding = _handle_binding(metadata)
+        metadata_final = final_path(metadata)
+
+        if access == 0:
+            handle = WinHandle(metadata, metadata_final, metadata_is_dir)
+            metadata = None
+            return handle
+
+        data = _open_raw(
+            sys_path, access, OPEN_EXISTING,
+            backup_semantics=metadata_is_dir)
+        data_is_dir = _verify_handle(data, expected_path)
+        data_binding = _handle_binding(data)
+        if (data_is_dir != metadata_is_dir
+                or data_binding != metadata_binding):
+            raise FsError(IssueCode.IDENTITY_UNVERIFIED)
+        data_final = final_path(data)
+        handle = WinHandle(data, data_final, data_is_dir)
+        data = None
+        return handle
+    finally:
+        if data is not None:
+            _close(data)
+        if metadata is not None:
+            _close(metadata)
 
 
-def _pin_ancestor_chain(abspath: str) -> list[WinHandle]:
+def _pin_ancestor_chain(abspath: str) -> tuple[list[WinHandle], bool]:
     """Validate and bind each directory prefix before inspecting deeper paths."""
     prefixes = _path_prefixes(abspath, include_self=True)
     guards = []
@@ -440,15 +486,16 @@ def _pin_ancestor_chain(abspath: str) -> list[WinHandle]:
             st = _lstat_prefix(path)
             if not stat.S_ISDIR(st.st_mode):
                 raise FsError(IssueCode.PATH_NOT_FOUND)
-            guard = open_verified(path, long_path(path), access=0)
+            guard = open_verified(
+                path, long_path(path), access=0, expected_is_dir=True)
             if not guard.is_dir:
                 guard.close()
                 raise FsError(IssueCode.IDENTITY_UNVERIFIED)
             guards.append(guard)
         # Ancestors are now held without FILE_SHARE_DELETE.  Only now may the
         # leaf itself be queried.
-        _lstat_prefix(prefixes[-1])
-        return guards
+        leaf_st = _lstat_prefix(prefixes[-1])
+        return guards, stat.S_ISDIR(leaf_st.st_mode)
     except BaseException:
         for guard in reversed(guards):
             guard.close()
@@ -457,10 +504,11 @@ def _pin_ancestor_chain(abspath: str) -> list[WinHandle]:
 
 def open_root(abspath: str) -> WinHandle:
     check_selectable(abspath)
-    guards = _pin_ancestor_chain(abspath)
+    guards, leaf_is_dir = _pin_ancestor_chain(abspath)
     try:
         expected = long_path(abspath)
-        handle = open_verified(abspath, expected)
+        handle = open_verified(
+            abspath, expected, expected_is_dir=leaf_is_dir)
         # Re-check while every ancestor guard and the leaf handle are held.
         try:
             check_ancestors(abspath, include_self=False)
@@ -485,8 +533,9 @@ def open_child(parent: WinHandle, name: str) -> WinHandle:
     # The verified parent remains pinned while the child itself is inspected
     # without following it.  Reject recall/offline/device/reparse attributes
     # before GENERIC_READ can trigger an open of that leaf.
-    _lstat_prefix(selectable)
-    child = open_verified(sys_path, sys_path)
+    child_st = _lstat_prefix(selectable)
+    child = open_verified(
+        sys_path, sys_path, expected_is_dir=stat.S_ISDIR(child_st.st_mode))
     try:
         if parent.snapshot() != before or not same_path(final_path(parent._h), parent.sys_path):
             raise FsError(IssueCode.MUTATION_DETECTED)
