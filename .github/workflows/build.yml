@@ -15,10 +15,12 @@ jobs:
     steps:
       - name: Fetch source
         shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: '0'
         run: |
           git init -q .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git -c "http.extraheader=AUTHORIZATION: bearer ${{ github.token }}" fetch -q --depth=1 origin "${GITHUB_SHA}"
+          git -c credential.helper= -c http.extraheader= fetch -q --depth=1 origin "${GITHUB_SHA}"
           git checkout -q FETCH_HEAD
 
       # The build tool is the only non-stdlib dependency (build time only).
