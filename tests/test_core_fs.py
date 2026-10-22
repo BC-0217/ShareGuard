@@ -1,8 +1,11 @@
 """Symlink / junction / reparse rejection, scope, special paths, permissions."""
 
+import csv
 import hashlib
+import io
 import json
 import os
+import re
 import stat
 import subprocess
 import types
@@ -20,6 +23,37 @@ WINDOWS = os.name == "nt"
 
 def secret_line():
     return f'client_secret = "{SECRET_CANARY}{synthetic(10, 4)}"\n'
+
+
+SID_PATTERN = re.compile(r"S-\d+-\d+(?:-\d+)+", re.IGNORECASE)
+
+
+def parse_whoami_sid(output):
+    """Parse the SID column from one machine-format ``whoami`` CSV row."""
+    try:
+        rows = list(csv.reader(io.StringIO(output), strict=True))
+    except csv.Error:
+        return None
+    if len(rows) != 1 or len(rows[0]) != 2:
+        return None
+    sid = rows[0][1].strip()
+    return sid if SID_PATTERN.fullmatch(sid) else None
+
+
+def current_token_sid():
+    """Return the current Windows token SID without exposing account names."""
+    if not WINDOWS:
+        return None
+    try:
+        result = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, errors="replace",
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_whoami_sid(result.stdout)
 
 
 class Junctions(WorkDirTestCase):
@@ -260,16 +294,44 @@ class SpecialPaths(WorkDirTestCase):
 
 
 class Permissions(WorkDirTestCase):
+    def test_whoami_sid_parser_uses_sid_column(self):
+        account_name = "S-1-5-999"
+        token_sid = "S-1-5-21-111111111-222222222-333333333-4444"
+        row = f'"{account_name}","{token_sid}"\r\n'
+        self.assertEqual(parse_whoami_sid(row), token_sid)
+        for malformed in (
+                "",
+                f'"{account_name}"\r\n',
+                f'"{account_name}","not-a-sid"\r\n',
+                row + row,
+                f'"{account_name}","{token_sid}\r\n'):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(parse_whoami_sid(malformed))
+
     def test_unreadable_file_is_incomplete(self):
         p = self.write("d/locked.txt", secret_line())
         if WINDOWS:
-            user = os.environ.get("USERNAME")
-            res = subprocess.run(["icacls", p, "/deny", f"{user}:(R)"],
-                                 capture_output=True)
-            if res.returncode != 0:
-                self.skipTest("icacls deny unavailable")
+            sid = current_token_sid()
+            if sid is None:
+                self.skipTest("unreadable-fixture-unavailable")
+            deny = subprocess.run(
+                ["icacls", p, "/deny", f"*{sid}:(R)"],
+                capture_output=True,
+            )
+            if deny.returncode != 0:
+                self.skipTest("unreadable-fixture-unavailable")
             self._cleanups_fs.append(
-                lambda: subprocess.run(["icacls", p, "/reset"], capture_output=True))
+                lambda: subprocess.run(
+                    ["icacls", p, "/reset"], capture_output=True))
+            try:
+                with open(p, "rb") as handle:
+                    handle.read(1)
+            except PermissionError:
+                pass
+            except OSError:
+                self.fail("unreadable fixture probe did not raise PermissionError")
+            else:
+                self.skipTest("unreadable-fixture-unavailable")
         else:
             if os.geteuid() == 0:
                 self.skipTest("root bypasses permissions")
@@ -278,6 +340,16 @@ class Permissions(WorkDirTestCase):
         r = scan_paths([self.path("d")])
         self.assertEqual(r.completeness, INCOMPLETE)
         self.assertIn("ACCESS_DENIED", codes(r))
+        self.assertEqual(r.findings, [])
+
+    def test_access_denied_mapping_is_incomplete(self):
+        p = self.write("mapping/ordinary.txt", secret_line())
+        with mock.patch.object(
+                safeio, "open_root",
+                side_effect=safeio.FsError("ACCESS_DENIED")):
+            r = scan_paths([p])
+        self.assertEqual(r.completeness, INCOMPLETE)
+        self.assertEqual(codes(r), {"ACCESS_DENIED"})
         self.assertEqual(r.findings, [])
 
 

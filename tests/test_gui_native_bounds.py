@@ -24,11 +24,148 @@ from shareguard import gui, locales  # noqa: E402
 
 if os.name == "nt":
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
     _get_client_rect = _user32.GetClientRect
     _get_client_rect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     _get_client_rect.restype = wintypes.BOOL
+
+    _get_process_window_station = _user32.GetProcessWindowStation
+    _get_process_window_station.argtypes = []
+    _get_process_window_station.restype = wintypes.HANDLE
+
+    _get_user_object_information = _user32.GetUserObjectInformationW
+    _get_user_object_information.argtypes = [
+        wintypes.HANDLE,
+        wintypes.INT,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _get_user_object_information.restype = wintypes.BOOL
+
+    _open_input_desktop = _user32.OpenInputDesktop
+    _open_input_desktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _open_input_desktop.restype = wintypes.HANDLE
+
+    _get_thread_desktop = _user32.GetThreadDesktop
+    _get_thread_desktop.argtypes = [wintypes.DWORD]
+    _get_thread_desktop.restype = wintypes.HANDLE
+
+    _close_desktop = _user32.CloseDesktop
+    _close_desktop.argtypes = [wintypes.HANDLE]
+    _close_desktop.restype = wintypes.BOOL
+
+    _get_current_thread_id = _kernel32.GetCurrentThreadId
+    _get_current_thread_id.argtypes = []
+    _get_current_thread_id.restype = wintypes.DWORD
+
+    class _USEROBJECTFLAGS(ctypes.Structure):
+        _fields_ = [
+            ("fInherit", wintypes.BOOL),
+            ("fReserved", wintypes.BOOL),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
 else:
     _get_client_rect = None
+
+
+_UOI_FLAGS = 1
+_UOI_NAME = 2
+_WSF_VISIBLE = 0x0001
+_DESKTOP_READOBJECTS = 0x0001
+_PHYSICAL_HIT_SKIP_REASON = (
+    "physical screen hit test requires a visible window station and "
+    "matching active input desktop"
+)
+
+
+def _user_object_name(handle):
+    needed = wintypes.DWORD()
+    _get_user_object_information(
+        handle, _UOI_NAME, None, 0, ctypes.byref(needed)
+    )
+    if not needed.value:
+        return None
+    char_count = (needed.value + ctypes.sizeof(ctypes.c_wchar) - 1) // ctypes.sizeof(
+        ctypes.c_wchar
+    )
+    buffer = ctypes.create_unicode_buffer(char_count)
+    if not _get_user_object_information(
+        handle,
+        _UOI_NAME,
+        ctypes.cast(buffer, ctypes.c_void_p),
+        needed.value,
+        ctypes.byref(needed),
+    ):
+        return None
+    return buffer.value
+
+
+def physical_hit_preconditions():
+    """Return interactive-desktop eligibility and identity-free diagnostics."""
+    diagnostics = {
+        "window_station_observable": False,
+        "window_station_visible": False,
+        "input_desktop_accessible": False,
+        "thread_desktop_handle_available": False,
+        "desktop_names_observable": False,
+        "input_desktop_matches_thread": False,
+        "input_desktop_handle_closed": True,
+    }
+    if os.name != "nt":
+        return False, diagnostics
+
+    station = _get_process_window_station()
+    if not station:
+        return False, diagnostics
+
+    flags = _USEROBJECTFLAGS()
+    needed = wintypes.DWORD()
+    if _get_user_object_information(
+        station,
+        _UOI_FLAGS,
+        ctypes.byref(flags),
+        ctypes.sizeof(flags),
+        ctypes.byref(needed),
+    ):
+        diagnostics["window_station_observable"] = True
+        diagnostics["window_station_visible"] = bool(flags.dwFlags & _WSF_VISIBLE)
+
+    input_desktop = _open_input_desktop(0, False, _DESKTOP_READOBJECTS)
+    if not input_desktop:
+        return False, diagnostics
+
+    diagnostics["input_desktop_accessible"] = True
+    diagnostics["input_desktop_handle_closed"] = False
+    eligible = False
+    try:
+        thread_desktop = _get_thread_desktop(_get_current_thread_id())
+        diagnostics["thread_desktop_handle_available"] = bool(thread_desktop)
+        input_name = _user_object_name(input_desktop)
+        thread_name = _user_object_name(thread_desktop) if thread_desktop else None
+        diagnostics["desktop_names_observable"] = bool(
+            input_name is not None and thread_name is not None
+        )
+        diagnostics["input_desktop_matches_thread"] = bool(
+            diagnostics["desktop_names_observable"]
+            and input_name.casefold() == thread_name.casefold()
+        )
+        eligible = bool(
+            diagnostics["window_station_observable"]
+            and diagnostics["window_station_visible"]
+            and diagnostics["input_desktop_accessible"]
+            and diagnostics["thread_desktop_handle_available"]
+            and diagnostics["desktop_names_observable"]
+            and diagnostics["input_desktop_matches_thread"]
+        )
+    finally:
+        if not _close_desktop(input_desktop):
+            raise ctypes.WinError(ctypes.get_last_error())
+        diagnostics["input_desktop_handle_closed"] = True
+
+    return eligible, diagnostics
 
 
 def make_result():
@@ -95,9 +232,40 @@ def settle_client(root, expected, timeout=2.0):
 
 @unittest.skipUnless(os.name == "nt", "native client-bounds test requires Windows")
 class NativeClientBoundsTests(unittest.TestCase):
-    def test_all_post_result_actions_fit_and_hit_test_at_supported_sizes(self):
+    def test_logical_bounds_invoke_and_localization_at_supported_sizes(self):
+        self._run_matrix("logical", check_physical_hits=False)
+
+    def test_physical_screen_hits_at_supported_sizes(self):
+        eligible, diagnostics = physical_hit_preconditions()
+        precondition_path = ROOT / "artifacts" / "ui-native-hit-preconditions.json"
+        precondition_path.parent.mkdir(parents=True, exist_ok=True)
+        precondition_path.write_text(
+            json.dumps(
+                {
+                    "schema": "shareguard.ui-native-hit-preconditions/1",
+                    "safe_booleans_only": True,
+                    "diagnostics": diagnostics,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if not eligible:
+            self.skipTest(_PHYSICAL_HIT_SKIP_REASON)
+        self._run_matrix(
+            "physical-hit",
+            check_physical_hits=True,
+            os_preconditions=diagnostics,
+        )
+
+    def _run_matrix(
+        self, evidence_label, check_physical_hits, os_preconditions=None
+    ):
         import tkinter
 
+        self._evidence_label = evidence_label
         self.root = tkinter.Tk()
         self.app = gui.ShareGuardApp(self.root)
         self._install_lifecycle_proof()
@@ -123,19 +291,35 @@ class NativeClientBoundsTests(unittest.TestCase):
                 for theme in ("light", "dark"):
                     with self.subTest(size=(width, height), language=language, theme=theme):
                         self._measure_and_assert_case(
-                            width, height, language, theme, invoked, evidence
+                            width,
+                            height,
+                            language,
+                            theme,
+                            invoked,
+                            evidence,
+                            check_physical_hits=check_physical_hits,
                         )
 
         output = {
             "schema": "shareguard.ui-native-bounds-measurements/1",
             "measurements_only": True,
             "test_outcome_source": "unittest result",
+            "evidence_kind": evidence_label,
             "cases": len(evidence),
+            "button_cases": len(evidence) * 7,
+            "physical_hit_checks": len(evidence) * 7 if check_physical_hits else 0,
             "minimum_client": [720, 480],
             "normal_client": [900, 620],
             "combinations": evidence,
         }
-        evidence_path = ROOT / "artifacts" / "ui-native-bounds.json"
+        if os_preconditions is not None:
+            output["os_preconditions"] = dict(os_preconditions)
+        filename = (
+            "ui-native-physical-hit.json"
+            if check_physical_hits
+            else "ui-native-bounds.json"
+        )
+        evidence_path = ROOT / "artifacts" / filename
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         evidence_path.write_text(
             json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -177,7 +361,15 @@ class NativeClientBoundsTests(unittest.TestCase):
             essential.clear()
 
     def _measure_and_assert_case(
-        self, width, height, language, theme, invoked, evidence
+        self,
+        width,
+        height,
+        language,
+        theme,
+        invoked,
+        evidence,
+        *,
+        check_physical_hits,
     ):
         essential = None
         widget = None
@@ -206,38 +398,46 @@ class NativeClientBoundsTests(unittest.TestCase):
                 top = widget.winfo_rooty() - self.root.winfo_rooty()
                 right = left + widget.winfo_width()
                 bottom = top + widget.winfo_height()
-                screen_x = widget.winfo_rootx() + widget.winfo_width() // 2
-                screen_y = widget.winfo_rooty() + widget.winfo_height() // 2
                 before = len(invoked)
                 widget.invoke()
-                row["buttons"][name] = {
+                measured = {
                     "rect": [left, top, right, bottom],
                     "mapped": bool(widget.winfo_ismapped()),
                     "viewable": bool(widget.winfo_viewable()),
                     "state": str(widget.cget("state")),
-                    "hit": self.root.winfo_containing(screen_x, screen_y) is widget,
                     "invoked": invoked[before:] == [name],
                 }
+                if check_physical_hits:
+                    screen_x = widget.winfo_rootx() + widget.winfo_width() // 2
+                    screen_y = widget.winfo_rooty() + widget.winfo_height() // 2
+                    measured["hit"] = (
+                        self.root.winfo_containing(screen_x, screen_y) is widget
+                    )
+                row["buttons"][name] = measured
 
-            # Cancel is intentionally disabled after a result. Its center
-            # must still hit the native widget, and invoke must stay inert.
+            # Cancel is intentionally disabled after a result. Its geometry,
+            # disabled state, and inert invoke remain logical requirements.
             cancel = self.app.btn_cancel
             cancel_left = cancel.winfo_rootx() - self.root.winfo_rootx()
             cancel_top = cancel.winfo_rooty() - self.root.winfo_rooty()
             cancel_right = cancel_left + cancel.winfo_width()
             cancel_bottom = cancel_top + cancel.winfo_height()
-            cancel_x = cancel.winfo_rootx() + cancel.winfo_width() // 2
-            cancel_y = cancel.winfo_rooty() + cancel.winfo_height() // 2
             before_cancel = len(invoked)
             cancel.invoke()
-            row["buttons"]["cancel"] = {
+            cancel_measured = {
                 "rect": [cancel_left, cancel_top, cancel_right, cancel_bottom],
                 "mapped": bool(cancel.winfo_ismapped()),
                 "viewable": bool(cancel.winfo_viewable()),
                 "state": str(cancel.cget("state")),
-                "hit": self.root.winfo_containing(cancel_x, cancel_y) is cancel,
                 "disabled_invoke_suppressed": len(invoked) == before_cancel,
             }
+            if check_physical_hits:
+                cancel_x = cancel.winfo_rootx() + cancel.winfo_width() // 2
+                cancel_y = cancel.winfo_rooty() + cancel.winfo_height() // 2
+                cancel_measured["hit"] = (
+                    self.root.winfo_containing(cancel_x, cancel_y) is cancel
+                )
+            row["buttons"]["cancel"] = cancel_measured
 
             rendered = [
                 self.app.tree.item(item, "values")
@@ -259,10 +459,10 @@ class NativeClientBoundsTests(unittest.TestCase):
                 self.assertGreaterEqual(top, 0, name)
                 self.assertLessEqual(right, actual_width, name)
                 self.assertLessEqual(bottom, actual_height, name)
-                self.assertTrue(measured["hit"], name)
                 self.assertTrue(measured["invoked"], name)
+                if check_physical_hits:
+                    self.assertTrue(measured["hit"], name)
 
-            cancel_measured = row["buttons"]["cancel"]
             left, top, right, bottom = cancel_measured["rect"]
             self.assertTrue(cancel_measured["mapped"], "cancel")
             self.assertTrue(cancel_measured["viewable"], "cancel")
@@ -271,10 +471,11 @@ class NativeClientBoundsTests(unittest.TestCase):
             self.assertGreaterEqual(top, 0, "cancel")
             self.assertLessEqual(right, actual_width, "cancel")
             self.assertLessEqual(bottom, actual_height, "cancel")
-            self.assertTrue(cancel_measured["hit"], "cancel")
             self.assertTrue(
                 cancel_measured["disabled_invoke_suppressed"], "cancel"
             )
+            if check_physical_hits:
+                self.assertTrue(cancel_measured["hit"], "cancel")
 
             self.assertEqual(len(rendered), 4)
             for source, values in zip(self.app.result["findings"], rendered):
@@ -329,6 +530,7 @@ class NativeClientBoundsTests(unittest.TestCase):
         root_finalized = self._root_ref() is None
         lifecycle = {
             "schema": "shareguard.ui-native-lifecycle/1",
+            "evidence_kind": self._evidence_label,
             "creator_thread_id": self._creator_thread_id,
             "callbacks": list(self._lifecycle_events),
             "app_finalized": app_finalized,
@@ -337,7 +539,9 @@ class NativeClientBoundsTests(unittest.TestCase):
             "shutdown_failed": shutdown_failed,
             "fallback_failed": fallback_failed,
         }
-        evidence_path = ROOT / "artifacts" / "ui-native-lifecycle.json"
+        evidence_path = (
+            ROOT / "artifacts" / ("ui-native-lifecycle-%s.json" % self._evidence_label)
+        )
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         evidence_path.write_text(
             json.dumps(lifecycle, indent=2, sort_keys=True) + "\n",
