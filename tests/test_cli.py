@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import types
+import unittest
 from unittest import mock
 
 from tests import (PATH_CANARY, ROOT, SECRET_CANARY, SRC, WorkDirTestCase, synthetic,
@@ -18,6 +19,12 @@ from tests import (PATH_CANARY, ROOT, SECRET_CANARY, SRC, WorkDirTestCase, synth
 from shareguard import __version__, cli, platform_support
 from shareguard.model import ScanResult
 from shareguard.policy import Policy
+
+
+PUBLIC_CLI_SCAN = unittest.skipUnless(
+    platform_support.is_public_platform_supported(),
+    "public CLI scan requires Windows 10/11 x64",
+)
 
 
 def run(argv):
@@ -83,24 +90,28 @@ class ExitCodes(WorkDirTestCase):
             for canary in (PATH_CANARY, SECRET_CANARY, token("github"), self.work):
                 self.assertNotIn(canary, t)
 
+    @PUBLIC_CLI_SCAN
     def test_complete_no_findings_0(self):
         code, out, err = run(["scan", self.clean])
         self.assertEqual(code, 0)
         self.assertIn("Completeness: complete", out)
         self.assert_clean_output(out, err)
 
+    @PUBLIC_CLI_SCAN
     def test_complete_findings_1(self):
         code, out, err = run(["scan", self.dirty])
         self.assertEqual(code, 1)
         self.assertIn("token.github", out)
         self.assert_clean_output(out, err)
 
+    @PUBLIC_CLI_SCAN
     def test_incomplete_2(self):
         code, out, err = run(["scan", self.binary, self.dirty])
         self.assertEqual(code, 2)
         self.assertIn("BINARY_CONTENT", out)
         self.assert_clean_output(out, err)
 
+    @PUBLIC_CLI_SCAN
     def test_missing_path_2_without_echo(self):
         code, out, err = run(["scan", self.path(f"missing-{PATH_CANARY}")])
         self.assertEqual(code, 2)
@@ -125,6 +136,7 @@ class ExitCodes(WorkDirTestCase):
         self.assertFalse(os.path.exists(destination))
         self.assert_clean_output(out, err)
 
+    @PUBLIC_CLI_SCAN
     def test_cancel_3(self):
         cancelled = cli._synthetic_result(Policy(), "cancelled")
         with mock.patch.object(cli, "_run_scan", return_value=cancelled):
@@ -235,6 +247,7 @@ class PartialFrameIsolation(WorkDirTestCase):
 
 
 class OutputSanitizing(WorkDirTestCase):
+    @PUBLIC_CLI_SCAN
     def test_json_output_roundtrips_and_has_no_canaries(self):
         p = self.write(f"{PATH_CANARY}/k.txt", token("aws") + "\n")
         code, out, err = run(["scan", "--json", self.path(PATH_CANARY)])
@@ -280,6 +293,7 @@ class OutputSanitizing(WorkDirTestCase):
 
 
 class ReportOption(WorkDirTestCase):
+    @PUBLIC_CLI_SCAN
     def test_report_written(self):
         src = self.write("in/a.txt", "ok\n")
         dest = self.path("out.json")
@@ -288,6 +302,7 @@ class ReportOption(WorkDirTestCase):
         with open(dest, encoding="ascii") as fh:
             ScanResult.from_dict(json.load(fh))
 
+    @PUBLIC_CLI_SCAN
     def test_report_failure_exit_4_and_no_overwrite(self):
         self.write("in/a.txt", "ok\n")
         dest = self.write("existing.json", "keep")
@@ -297,6 +312,7 @@ class ReportOption(WorkDirTestCase):
         with open(dest, encoding="ascii") as fh:
             self.assertEqual(fh.read(), "keep")
 
+    @PUBLIC_CLI_SCAN
     def test_report_into_scanned_dir_refused(self):
         self.write(f"in-{PATH_CANARY}/a.txt", "ok\n")
         dest = self.path(f"in-{PATH_CANARY}", "r.json")
