@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import types
 import unittest
 from unittest import mock
@@ -47,13 +48,120 @@ def current_token_sid():
     try:
         result = subprocess.run(
             ["whoami", "/user", "/fo", "csv", "/nh"],
-            capture_output=True, text=True, errors="replace",
+            capture_output=True, text=True, errors="replace", timeout=5,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
         return None
     return parse_whoami_sid(result.stdout)
+
+
+LAST_PERMISSION_DIAGNOSTIC = {}
+
+
+def win32_read_open_probe(path, flags):
+    """Probe one owned file with CreateFileW and return numeric-only status."""
+    if not WINDOWS:
+        return None
+    import ctypes
+
+    from shareguard import _winfs
+
+    ctypes.set_last_error(0)
+    handle = _winfs._CreateFileW(
+        path,
+        _winfs.GENERIC_READ,
+        _winfs.FILE_SHARE_READ | _winfs.FILE_SHARE_WRITE,
+        None,
+        _winfs.OPEN_EXISTING,
+        flags,
+        None,
+    )
+    if handle in (None, _winfs.INVALID_HANDLE_VALUE):
+        return {"granted": False, "error": int(ctypes.get_last_error())}
+    try:
+        return {"granted": True, "error": 0}
+    finally:
+        _winfs._CloseHandle(handle)
+
+
+def win32_backup_privilege_enabled():
+    """Read whether SeBackupPrivilege is enabled; never alter token privileges."""
+    if not WINDOWS:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    from shareguard import _winfs
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process_token = advapi32.OpenProcessToken
+    open_process_token.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                   ctypes.POINTER(wintypes.HANDLE)]
+    open_process_token.restype = wintypes.BOOL
+    lookup_privilege_value = advapi32.LookupPrivilegeValueW
+    lookup_privilege_value.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                       ctypes.POINTER(LUID)]
+    lookup_privilege_value.restype = wintypes.BOOL
+    get_token_information = advapi32.GetTokenInformation
+    get_token_information.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                      wintypes.LPVOID, wintypes.DWORD,
+                                      ctypes.POINTER(wintypes.DWORD)]
+    get_token_information.restype = wintypes.BOOL
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = wintypes.HANDLE
+
+    token = wintypes.HANDLE()
+    if not open_process_token(get_current_process(), 0x0008, ctypes.byref(token)):
+        return None
+    try:
+        backup_luid = LUID()
+        if not lookup_privilege_value(
+                None, "SeBackupPrivilege", ctypes.byref(backup_luid)):
+            return None
+        needed = wintypes.DWORD()
+        get_token_information(token, 3, None, 0, ctypes.byref(needed))
+        if needed.value < ctypes.sizeof(wintypes.DWORD):
+            return None
+        buffer = (ctypes.c_ubyte * needed.value)()
+        if not get_token_information(
+                token, 3, buffer, needed.value, ctypes.byref(needed)):
+            return None
+        count = ctypes.cast(
+            buffer, ctypes.POINTER(wintypes.DWORD)).contents.value
+        offset = ctypes.sizeof(wintypes.DWORD)
+        entry_size = ctypes.sizeof(LUID_AND_ATTRIBUTES)
+        available = (needed.value - offset) // entry_size
+        if count > available:
+            return None
+        base = ctypes.addressof(buffer) + offset
+        for index in range(count):
+            entry = LUID_AND_ATTRIBUTES.from_address(
+                base + index * entry_size)
+            if (entry.Luid.LowPart == backup_luid.LowPart
+                    and entry.Luid.HighPart == backup_luid.HighPart):
+                return bool(entry.Attributes & 0x00000002)
+        return False
+    finally:
+        _winfs._CloseHandle(token)
+
+
+def scan_diagnostic(result):
+    """Return only fixed identifiers and numeric counters."""
+    return {
+        "completeness": result.completeness,
+        "issue_codes": sorted(codes(result)),
+        "counts": {key: int(value) for key, value in sorted(result.counts.items())},
+    }
 
 
 class Junctions(WorkDirTestCase):
@@ -314,15 +422,25 @@ class Permissions(WorkDirTestCase):
             sid = current_token_sid()
             if sid is None:
                 self.skipTest("unreadable-fixture-unavailable")
-            deny = subprocess.run(
-                ["icacls", p, "/deny", f"*{sid}:(R)"],
-                capture_output=True,
-            )
+            try:
+                deny = subprocess.run(
+                    ["icacls", p, "/deny", f"*{sid}:(R)"],
+                    capture_output=True, timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                self.skipTest("unreadable-fixture-unavailable")
             if deny.returncode != 0:
                 self.skipTest("unreadable-fixture-unavailable")
-            self._cleanups_fs.append(
-                lambda: subprocess.run(
-                    ["icacls", p, "/reset"], capture_output=True))
+
+            def reset_acl():
+                try:
+                    subprocess.run(
+                        ["icacls", p, "/reset"], capture_output=True,
+                        timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+            self._cleanups_fs.append(reset_acl)
             try:
                 with open(p, "rb") as handle:
                     handle.read(1)
@@ -332,15 +450,62 @@ class Permissions(WorkDirTestCase):
                 self.fail("unreadable fixture probe did not raise PermissionError")
             else:
                 self.skipTest("unreadable-fixture-unavailable")
+
+            from shareguard import _winfs
+
+            plain_open = win32_read_open_probe(p, 0)
+            backup_open = win32_read_open_probe(
+                p,
+                _winfs.FILE_FLAG_BACKUP_SEMANTICS
+                | _winfs.FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            backup_enabled = win32_backup_privilege_enabled()
+            basename = os.path.basename(p)
+            try:
+                parent_visible = basename in os.listdir(self.path("d"))
+            except OSError:
+                parent_visible = None
+            native_visible = None
+            native_issue = None
+            try:
+                directory = safeio.open_root(self.path("d"))
+                try:
+                    native_visible = basename in directory.list_names(100)
+                finally:
+                    directory.close()
+            except safeio.FsError as exc:
+                native_issue = exc.code
+
+            folder_result = scan_paths([self.path("d")])
+            direct_result = scan_paths([p])
+            diagnostic = {
+                "stdread_permission_error": True,
+                "plain_open": plain_open,
+                "backup_reparse_open": backup_open,
+                "backup_privilege_enabled": backup_enabled,
+                "parent_list_visible": parent_visible,
+                "native_list_visible": native_visible,
+                "native_list_issue": native_issue,
+                "folder_scan": scan_diagnostic(folder_result),
+                "direct_scan": scan_diagnostic(direct_result),
+            }
+            LAST_PERMISSION_DIAGNOSTIC.clear()
+            LAST_PERMISSION_DIAGNOSTIC.update(diagnostic)
+            r = folder_result
         else:
             if os.geteuid() == 0:
                 self.skipTest("root bypasses permissions")
             os.chmod(p, 0)
             self._cleanups_fs.append(lambda: os.chmod(p, 0o600))
-        r = scan_paths([self.path("d")])
-        self.assertEqual(r.completeness, INCOMPLETE)
-        self.assertIn("ACCESS_DENIED", codes(r))
-        self.assertEqual(r.findings, [])
+            r = scan_paths([self.path("d")])
+        diagnostic_text = json.dumps(
+            LAST_PERMISSION_DIAGNOSTIC, sort_keys=True, separators=(",", ":"))
+        if WINDOWS:
+            print("SHAREGUARD_PERMISSION_DIAGNOSTIC=" + diagnostic_text,
+                  file=sys.stderr, flush=True)
+        self.assertEqual(r.completeness, INCOMPLETE, diagnostic_text)
+        self.assertIn("ACCESS_DENIED", codes(r), diagnostic_text)
+        self.assertEqual(r.findings, [], diagnostic_text)
 
     def test_access_denied_mapping_is_incomplete(self):
         p = self.write("mapping/ordinary.txt", secret_line())

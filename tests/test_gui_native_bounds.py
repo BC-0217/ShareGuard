@@ -25,6 +25,7 @@ from shareguard import gui, locales  # noqa: E402
 if os.name == "nt":
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
 
     _get_client_rect = _user32.GetClientRect
     _get_client_rect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
@@ -60,6 +61,74 @@ if os.name == "nt":
     _get_current_thread_id.argtypes = []
     _get_current_thread_id.restype = wintypes.DWORD
 
+    def _typed_api(dll, name, argtypes, restype):
+        function = getattr(dll, name, None)
+        if function is not None:
+            function.argtypes = argtypes
+            function.restype = restype
+        return function
+
+    _get_current_process_id = _typed_api(
+        _kernel32, "GetCurrentProcessId", [], wintypes.DWORD
+    )
+    _process_id_to_session_id = _typed_api(
+        _kernel32,
+        "ProcessIdToSessionId",
+        [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)],
+        wintypes.BOOL,
+    )
+    _wts_get_active_console_session_id = _typed_api(
+        _kernel32, "WTSGetActiveConsoleSessionId", [], wintypes.DWORD
+    )
+    _wts_query_session_information = _typed_api(
+        _wtsapi32,
+        "WTSQuerySessionInformationW",
+        [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.INT,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.DWORD),
+        ],
+        wintypes.BOOL,
+    )
+    _wts_free_memory = _typed_api(
+        _wtsapi32, "WTSFreeMemory", [ctypes.c_void_p], None
+    )
+    _get_foreground_window = _typed_api(
+        _user32, "GetForegroundWindow", [], wintypes.HWND
+    )
+    _get_window_thread_process_id = _typed_api(
+        _user32,
+        "GetWindowThreadProcessId",
+        [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)],
+        wintypes.DWORD,
+    )
+    _get_ancestor = _typed_api(
+        _user32, "GetAncestor", [wintypes.HWND, wintypes.UINT], wintypes.HWND
+    )
+    _window_from_point = _typed_api(
+        _user32, "WindowFromPoint", [wintypes.POINT], wintypes.HWND
+    )
+    _get_window_rect = _typed_api(
+        _user32,
+        "GetWindowRect",
+        [wintypes.HWND, ctypes.POINTER(wintypes.RECT)],
+        wintypes.BOOL,
+    )
+    _get_dpi_for_window = _typed_api(
+        _user32, "GetDpiForWindow", [wintypes.HWND], wintypes.UINT
+    )
+    _get_thread_dpi_awareness_context = _typed_api(
+        _user32, "GetThreadDpiAwarenessContext", [], wintypes.HANDLE
+    )
+    _get_awareness_from_dpi_awareness_context = _typed_api(
+        _user32,
+        "GetAwarenessFromDpiAwarenessContext",
+        [wintypes.HANDLE],
+        wintypes.INT,
+    )
+
     class _USEROBJECTFLAGS(ctypes.Structure):
         _fields_ = [
             ("fInherit", wintypes.BOOL),
@@ -75,6 +144,11 @@ _UOI_FLAGS = 1
 _UOI_NAME = 2
 _WSF_VISIBLE = 0x0001
 _DESKTOP_READOBJECTS = 0x0001
+_GA_ROOT = 2
+_WTS_CURRENT_SESSION = 0xFFFFFFFF
+_WTS_CONNECT_STATE = 8
+_WTS_ACTIVE = 0
+_INVALID_SESSION_ID = 0xFFFFFFFF
 _PHYSICAL_HIT_SKIP_REASON = (
     "physical screen hit test requires a visible window station and "
     "matching active input desktop"
@@ -166,6 +240,148 @@ def physical_hit_preconditions():
         diagnostics["input_desktop_handle_closed"] = True
 
     return eligible, diagnostics
+
+
+def _wts_current_session_active():
+    buffer = ctypes.c_void_p()
+    size = wintypes.DWORD()
+    observable = bool(
+        _wts_query_session_information(
+            None,
+            _WTS_CURRENT_SESSION,
+            _WTS_CONNECT_STATE,
+            ctypes.byref(buffer),
+            ctypes.byref(size),
+        )
+    )
+    try:
+        active = bool(
+            observable
+            and buffer.value
+            and size.value >= ctypes.sizeof(ctypes.c_int)
+            and ctypes.cast(buffer, ctypes.POINTER(ctypes.c_int)).contents.value
+            == _WTS_ACTIVE
+        )
+    finally:
+        if buffer.value:
+            _wts_free_memory(buffer)
+    return observable, active
+
+
+def _window_owner_is_ours(hwnd):
+    owner = wintypes.DWORD()
+    return bool(
+        hwnd
+        and _get_window_thread_process_id(hwnd, ctypes.byref(owner))
+        and owner.value == _get_current_process_id()
+    )
+
+
+def _rect_values(hwnd, client=False):
+    rect = wintypes.RECT()
+    getter = _get_client_rect if client else _get_window_rect
+    if not hwnd or not getter(hwnd, ctypes.byref(rect)):
+        return None
+    return [rect.left, rect.top, rect.right, rect.bottom]
+
+
+def physical_hit_diagnostic(root, widget, center_x, center_y, os_gate_booleans):
+    """Collect safe booleans and numeric geometry for only our GUI."""
+    containing = None
+    try:
+        root_handle = wintypes.HWND(root.winfo_id())
+        root_outer = _get_ancestor(root_handle, _GA_ROOT)
+        foreground = _get_foreground_window()
+        point_window = _window_from_point(wintypes.POINT(center_x, center_y))
+        containing = root.winfo_containing(center_x, center_y)
+
+        wts_observable, wts_active = _wts_current_session_active()
+        process_session = wintypes.DWORD()
+        process_session_observable = bool(
+            _process_id_to_session_id(
+                _get_current_process_id(), ctypes.byref(process_session)
+            )
+        )
+        active_console = _wts_get_active_console_session_id()
+        process_is_active_console = bool(
+            process_session_observable
+            and active_console != _INVALID_SESSION_ID
+            and process_session.value == active_console
+        )
+
+        awareness = None
+        if (
+            _get_thread_dpi_awareness_context is not None
+            and _get_awareness_from_dpi_awareness_context is not None
+        ):
+            context = _get_thread_dpi_awareness_context()
+            awareness = (
+                int(_get_awareness_from_dpi_awareness_context(context))
+                if context
+                else None
+            )
+
+        diagnostic = {
+            "schema": "shareguard.native-hit-diagnostic/1",
+            "os_gate_booleans": {
+                key: bool(value) for key, value in os_gate_booleans.items()
+            },
+            "wts_current_session_state_observable": wts_observable,
+            "wts_current_session_active": wts_active,
+            "process_session_observable": process_session_observable,
+            "process_is_active_console": process_is_active_console,
+            "foreground_owner_is_our_pid": _window_owner_is_ours(foreground),
+            "root_native_outer_is_foreground": bool(
+                root_outer and foreground and root_outer == foreground
+            ),
+            "window_from_point_is_null": not bool(point_window),
+            "window_from_point_owner_is_our_pid": _window_owner_is_ours(
+                point_window
+            ),
+            "tk_containing_is_none": containing is None,
+            "tk_containing_is_our_widget": containing is widget,
+            "tk_containing_is_our_root": containing is root,
+            "own_root_outer_rect": _rect_values(root_outer),
+            "own_root_client_rect": _rect_values(root_handle, client=True),
+            "own_widget_screen_rect": [
+                widget.winfo_rootx(),
+                widget.winfo_rooty(),
+                widget.winfo_rootx() + widget.winfo_width(),
+                widget.winfo_rooty() + widget.winfo_height(),
+            ],
+            "dpi_for_own_root": (
+                int(_get_dpi_for_window(root_outer))
+                if _get_dpi_for_window is not None and root_outer
+                else None
+            ),
+            "thread_dpi_awareness": awareness,
+        }
+    finally:
+        containing = None
+        widget = None
+        root = None
+    return diagnostic
+
+
+def emit_physical_hit_diagnostic(
+    root, widget, center_x, center_y, os_gate_booleans, button_name
+):
+    diagnostic = None
+    try:
+        diagnostic = physical_hit_diagnostic(
+            root, widget, center_x, center_y, os_gate_booleans
+        )
+        diagnostic["button"] = button_name
+        print(
+            "SHAREGUARD_NATIVE_HIT_DIAGNOSTIC "
+            + json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+            file=sys.stderr,
+            flush=True,
+        )
+    finally:
+        diagnostic = None
+        widget = None
+        root = None
 
 
 def make_result():
@@ -266,6 +482,7 @@ class NativeClientBoundsTests(unittest.TestCase):
         import tkinter
 
         self._evidence_label = evidence_label
+        self._os_preconditions = dict(os_preconditions or {})
         self.root = tkinter.Tk()
         self.app = gui.ShareGuardApp(self.root)
         self._install_lifecycle_proof()
@@ -373,6 +590,7 @@ class NativeClientBoundsTests(unittest.TestCase):
     ):
         essential = None
         widget = None
+        diagnostic_widget = None
         cancel = None
         rendered = None
         source = None
@@ -461,6 +679,19 @@ class NativeClientBoundsTests(unittest.TestCase):
                 self.assertLessEqual(bottom, actual_height, name)
                 self.assertTrue(measured["invoked"], name)
                 if check_physical_hits:
+                    if not measured["hit"]:
+                        diagnostic_widget = essential[name]
+                        emit_physical_hit_diagnostic(
+                            self.root,
+                            diagnostic_widget,
+                            diagnostic_widget.winfo_rootx()
+                            + diagnostic_widget.winfo_width() // 2,
+                            diagnostic_widget.winfo_rooty()
+                            + diagnostic_widget.winfo_height() // 2,
+                            self._os_preconditions,
+                            name,
+                        )
+                        diagnostic_widget = None
                     self.assertTrue(measured["hit"], name)
 
             left, top, right, bottom = cancel_measured["rect"]
@@ -475,6 +706,15 @@ class NativeClientBoundsTests(unittest.TestCase):
                 cancel_measured["disabled_invoke_suppressed"], "cancel"
             )
             if check_physical_hits:
+                if not cancel_measured["hit"]:
+                    emit_physical_hit_diagnostic(
+                        self.root,
+                        cancel,
+                        cancel.winfo_rootx() + cancel.winfo_width() // 2,
+                        cancel.winfo_rooty() + cancel.winfo_height() // 2,
+                        self._os_preconditions,
+                        "cancel",
+                    )
                 self.assertTrue(cancel_measured["hit"], "cancel")
 
             self.assertEqual(len(rendered), 4)
@@ -501,6 +741,7 @@ class NativeClientBoundsTests(unittest.TestCase):
             values = None
             rendered = None
             cancel = None
+            diagnostic_widget = None
             widget = None
             if essential is not None:
                 essential.clear()
